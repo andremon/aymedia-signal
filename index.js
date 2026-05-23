@@ -134,11 +134,9 @@ wss.on('connection', (ws, req) => {
           });
         }
 
-        const qrDataUrl = await QRCode.toDataURL(activationUrl);
         ws.send(JSON.stringify({
           type: 'activation_code',
           code,
-          qrDataUrl,
           activationUrl,
           expiresIn: 300
         }));
