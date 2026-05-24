@@ -334,12 +334,18 @@ app.post('/api/auth/send-code', async (req, res) => {
     const smsUser = process.env.SMS_GATEWAY_BRUKERNAVN;
     const smsPass = process.env.SMS_GATEWAY_PASSORD;
 
+    const smsHeaders = { 'Content-Type': 'application/json' };
+    const smsApiKey = process.env.SMS_GATEWAY_API_KEY;
+    if (smsApiKey) {
+      // sms.ay.no støtter Bearer token
+      smsHeaders['Authorization'] = 'Bearer ' + smsApiKey;
+    } else if (smsUser && smsPass) {
+      smsHeaders['Authorization'] = 'Basic ' + Buffer.from(`${smsUser}:${smsPass}`).toString('base64');
+    }
+
     const smsRes = await fetch(`${smsUrl}/api/3rdparty/v1/message`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Basic ' + Buffer.from(`${smsUser}:${smsPass}`).toString('base64'),
-      },
+      headers: smsHeaders,
       body: JSON.stringify({
         message: `Din AyMedia-kode er: ${code}\nKoden er gyldig i 10 minutter.`,
         phoneNumbers: [normalizedPhone],
