@@ -22,7 +22,7 @@ try {
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    databaseURL: process.env.FIREBASE_DATABASE_URL || `https://chess-arena-1e641-default-rtdb.europe-west1.firebasedatabase.app`
+    databaseURL: `https://${process.env.FIREBASE_PROJECT_ID || 'chess-arena-1e641'}-default-rtdb.firebaseio.com`
   });
   firebaseInitialized = true;
   console.log('[Firebase] Initialisert OK');
@@ -305,4 +305,139 @@ process.on('SIGTERM', () => {
   console.log('[Server] Avslutter...');
   clearInterval(pingInterval);
   server.close(() => process.exit(0));
+});
+
+// ─── SMS-basert autentisering ─────────────────────────────────────────────────
+
+// Lagrer SMS-koder midlertidig: telefonnummer → {kode, expires, userId}
+const smsCodes = new Map();
+
+// Send SMS-verifiseringskode
+app.post('/api/auth/send-code', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Telefonnummer mangler' });
+
+  // Normaliser telefonnummer
+  let normalizedPhone = phone.replace(/\s/g, '');
+  if (normalizedPhone.startsWith('0')) normalizedPhone = '+47' + normalizedPhone.slice(1);
+  if (!normalizedPhone.startsWith('+')) normalizedPhone = '+47' + normalizedPhone;
+
+  // Generer 6-tegns kode
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const expires = Date.now() + 10 * 60 * 1000; // 10 minutter
+
+  smsCodes.set(normalizedPhone, { code, expires });
+
+  // Send SMS via sms.ay.no
+  try {
+    const smsUrl = process.env.SMS_GATEWAY_URL || 'https://sms.ay.no';
+    const smsUser = process.env.SMS_GATEWAY_BRUKERNAVN;
+    const smsPass = process.env.SMS_GATEWAY_PASSORD;
+
+    const smsRes = await fetch(`${smsUrl}/api/3rdparty/v1/message`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(`${smsUser}:${smsPass}`).toString('base64'),
+      },
+      body: JSON.stringify({
+        message: `Din AyMedia-kode er: ${code}\nKoden er gyldig i 10 minutter.`,
+        phoneNumbers: [normalizedPhone],
+      }),
+    });
+
+    if (!smsRes.ok) {
+      const err = await smsRes.text();
+      console.error('[SMS] Feil ved sending:', err);
+      return res.status(500).json({ error: 'Kunne ikke sende SMS — prøv igjen' });
+    }
+
+    console.log(`[SMS] Kode sendt til ${normalizedPhone}`);
+    res.json({ success: true, message: 'SMS sendt!' });
+
+  } catch (err) {
+    console.error('[SMS] Unntak:', err.message);
+    res.status(500).json({ error: 'SMS-tjeneste utilgjengelig' });
+  }
+});
+
+// Verifiser SMS-kode
+app.post('/api/auth/verify-code', async (req, res) => {
+  const { phone, code } = req.body;
+  if (!phone || !code) return res.status(400).json({ error: 'Mangler telefon eller kode' });
+
+  let normalizedPhone = phone.replace(/\s/g, '');
+  if (normalizedPhone.startsWith('0')) normalizedPhone = '+47' + normalizedPhone.slice(1);
+  if (!normalizedPhone.startsWith('+')) normalizedPhone = '+47' + normalizedPhone;
+
+  const stored = smsCodes.get(normalizedPhone);
+
+  if (!stored) return res.status(400).json({ error: 'Ingen kode funnet — be om ny' });
+  if (Date.now() > stored.expires) {
+    smsCodes.delete(normalizedPhone);
+    return res.status(400).json({ error: 'Koden er utløpt — be om ny' });
+  }
+  if (stored.code !== code.trim()) {
+    return res.status(400).json({ error: 'Feil kode — prøv igjen' });
+  }
+
+  // Kode riktig — slett og returner token
+  smsCodes.delete(normalizedPhone);
+
+  // Lag eller hent bruker i Firebase
+  let userId = null;
+  if (db) {
+    try {
+      // Bruk telefonnummer som bruker-ID (normalisert)
+      const safePhone = normalizedPhone.replace(/\+/g, '').replace(/[^0-9]/g, '');
+      userId = `phone_${safePhone}`;
+      await db.ref(`users/${userId}`).update({
+        phone: normalizedPhone,
+        lastLogin: Date.now(),
+      });
+    } catch (err) {
+      console.error('[Auth] Firebase feil:', err.message);
+    }
+  }
+
+  // Enkel token — i produksjon bør dette være JWT
+  const token = Buffer.from(JSON.stringify({
+    userId: userId || `phone_${normalizedPhone}`,
+    phone: normalizedPhone,
+    expires: Date.now() + 30 * 24 * 60 * 60 * 1000, // 30 dager
+  })).toString('base64');
+
+  res.json({ success: true, token, userId: userId || `phone_${normalizedPhone}` });
+});
+
+// Aktiver TV med telefon-token
+app.post('/api/activate-phone', async (req, res) => {
+  const { code, token } = req.body;
+  if (!code || !token) return res.status(400).json({ error: 'Mangler kode eller token' });
+
+  let userData;
+  try {
+    userData = JSON.parse(Buffer.from(token, 'base64').toString());
+    if (Date.now() > userData.expires) return res.status(401).json({ error: 'Token utløpt' });
+  } catch {
+    return res.status(401).json({ error: 'Ugyldig token' });
+  }
+
+  if (!db) return res.status(503).json({ error: 'Firebase ikke tilgjengelig' });
+
+  const ref = db.ref(`activation_codes/${code}`);
+  const snap = await ref.get();
+  const data = snap.val();
+
+  if (!data) return res.status(404).json({ error: 'Kode ikke funnet' });
+  if (data.activated) return res.status(400).json({ error: 'Kode allerede brukt' });
+  if (Date.now() > data.expires) return res.status(400).json({ error: 'Kode utløpt — be om ny' });
+
+  await ref.update({
+    activated: true,
+    userId: userData.userId,
+    userPhone: userData.phone,
+  });
+
+  res.json({ success: true, message: 'TV aktivert!' });
 });
