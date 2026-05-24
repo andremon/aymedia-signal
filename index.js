@@ -22,7 +22,7 @@ try {
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    databaseURL: `https://${process.env.FIREBASE_PROJECT_ID || 'chess-arena-1e641'}-default-rtdb.firebaseio.com`
+    databaseURL: process.env.FIREBASE_DATABASE_URL || `https://chess-arena-1e641-default-rtdb.europe-west1.firebasedatabase.app`
   });
   firebaseInitialized = true;
   console.log('[Firebase] Initialisert OK');
