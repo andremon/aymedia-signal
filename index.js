@@ -4,6 +4,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const { checkExpiredEvents, packEventToZip } = require('./events_storage');
 const QRCode = require('qrcode');
 const admin = require('firebase-admin');
 
@@ -22,7 +23,7 @@ try {
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    databaseURL: process.env.FIREBASE_DATABASE_URL || `https://chess-arena-1e641-default-rtdb.europe-west1.firebasedatabase.app`
+    databaseURL: `https://${process.env.FIREBASE_PROJECT_ID || 'chess-arena-1e641'}-default-rtdb.firebaseio.com`
   });
   firebaseInitialized = true;
   console.log('[Firebase] Initialisert OK');
@@ -82,9 +83,23 @@ wss.on('connection', (ws, req) => {
       // Enhet registrerer seg (TV, mobil, desktop)
       case 'register': {
         deviceId = msg.deviceId;
+        const deviceType = msg.deviceType || 'ukjent';
         clients.set(deviceId, ws);
         ws.send(JSON.stringify({ type: 'registered', deviceId }));
-        console.log(`[WS] Registrert: ${deviceId} (${msg.deviceType || 'ukjent'})`);
+        console.log(`[WS] Registrert: ${deviceId} (${deviceType})`);
+
+        // Varsle alle mobilapper om at en TV har koblet til igjen
+        if (deviceType === 'tv') {
+          for (const [id, client] of clients.entries()) {
+            if (id !== deviceId && client.readyState === 1) {
+              client.send(JSON.stringify({
+                type: 'device_connected',
+                deviceId,
+                deviceType,
+              }));
+            }
+          }
+        }
         break;
       }
 
@@ -300,6 +315,30 @@ server.listen(PORT, () => {
   console.log(`Klienter: ${clients.size}`);
 });
 
+// ─── SMS-hjelpefunksjon ───────────────────────────────────────────────────────
+async function sendSmsToNumber(phone, message) {
+  const smsUrl = process.env.SMS_GATEWAY_URL || 'https://sms.ay.no';
+  const smsApiKey = process.env.SMS_GATEWAY_API_KEY;
+  const headers = { 'Content-Type': 'application/json' };
+  if (smsApiKey) headers['Authorization'] = 'Bearer ' + smsApiKey;
+  try {
+    await fetch(`${smsUrl}/api/3rdparty/v1/message`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ message, phoneNumbers: [phone] }),
+    });
+    console.log(`[SMS] Sendt til ${phone}`);
+  } catch (err) {
+    console.error(`[SMS] Feil:`, err.message);
+  }
+}
+
+// ─── Events scheduler — sjekk hvert minutt ───────────────────────────────────
+setInterval(() => checkExpiredEvents(db, sendSmsToNumber), 60 * 1000);
+
+// Kjør ved oppstart
+setTimeout(() => checkExpiredEvents(db, sendSmsToNumber), 5000);
+
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('[Server] Avslutter...');
@@ -446,4 +485,299 @@ app.post('/api/activate-phone', async (req, res) => {
   });
 
   res.json({ success: true, message: 'TV aktivert!' });
+});
+
+// ─── EVENTS API ───────────────────────────────────────────────────────────────
+
+const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
+const { checkExpiredEvents, packEventToZip } = require('./events_storage');
+
+// Generer unik arrangementskode
+function generateEventCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 8; i++) {
+    if (i === 4) code += '-';
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+// Opprett arrangement
+app.post('/api/events/create', async (req, res) => {
+  const { token, name, date, theme, hostName } = req.body;
+  if (!token || !name) return res.status(400).json({ error: 'Mangler token eller navn' });
+
+  let userData;
+  try {
+    userData = JSON.parse(Buffer.from(token, 'base64').toString());
+    if (Date.now() > userData.expires) return res.status(401).json({ error: 'Token utløpt' });
+  } catch {
+    return res.status(401).json({ error: 'Ugyldig token' });
+  }
+
+  const eventCode = generateEventCode();
+  const eventId = uuidv4();
+  const { ownerPhone, ownerPhone2 } = req.body;
+
+  // 5 dager fra nå
+  const expiresAt = Date.now() + 5 * 24 * 60 * 60 * 1000;
+
+  if (db) {
+    await db.ref(`events/${eventCode}`).set({
+      id: eventId,
+      code: eventCode,
+      name,
+      date: date || null,
+      theme: theme || 'default',
+      hostName: hostName || '',
+      ownerId: userData.userId,
+      ownerPhone: ownerPhone || userData.phone || null,
+      ownerPhone2: ownerPhone2 || null,
+      created: Date.now(),
+      expiresAt,
+      active: true,
+      uploadCount: 0,
+      zipStatus: null,
+      settings: {
+        requireApproval: true,
+        maxUploads: 1000,
+        allowVideo: true,
+        allowMessages: true,
+      }
+    });
+  }
+
+  res.json({ success: true, eventCode, eventId });
+});
+
+// Hent arrangement
+app.get('/api/events/:code', async (req, res) => {
+  const { code } = req.params;
+  if (!db) return res.status(503).json({ error: 'Firebase ikke tilgjengelig' });
+
+  const snap = await db.ref(`events/${code}`).get();
+  const event = snap.val();
+  if (!event) return res.status(404).json({ error: 'Arrangement ikke funnet' });
+  if (!event.active) return res.status(410).json({ error: 'Arrangement er avsluttet' });
+
+  // Returner offentlig info (ikke ownerId)
+  res.json({
+    code: event.code,
+    name: event.name,
+    date: event.date,
+    theme: event.theme,
+    hostName: event.hostName,
+    settings: event.settings,
+    uploadCount: event.uploadCount || 0,
+  });
+});
+
+// Last opp bilde/video metadata fra gjest
+app.post('/api/events/:code/upload', async (req, res) => {
+  const { code } = req.params;
+  const { guestName, message, fileType, fileName, fileSize, fileData } = req.body;
+
+  if (!db) return res.status(503).json({ error: 'Firebase ikke tilgjengelig' });
+
+  const snap = await db.ref(`events/${code}`).get();
+  const event = snap.val();
+  if (!event || !event.active) return res.status(404).json({ error: 'Arrangement ikke funnet' });
+
+  const uploadId = uuidv4();
+  const status = event.settings?.requireApproval ? 'pending' : 'approved';
+
+  await db.ref(`events/${code}/uploads/${uploadId}`).set({
+    id: uploadId,
+    guestName: guestName || 'Gjest',
+    message: message || '',
+    fileType: fileType || 'image',
+    fileName: fileName || '',
+    fileSize: fileSize || 0,
+    fileData: fileData || null, // Base64 for små bilder
+    status,
+    timestamp: Date.now(),
+  });
+
+  // Oppdater teller
+  await db.ref(`events/${code}/uploadCount`).transaction(count => (count || 0) + 1);
+
+  // Varsle storskjerm via WebSocket om godkjent innhold
+  if (status === 'approved') {
+    wss.clients.forEach(client => {
+      if (client.readyState === 1) {
+        client.send(JSON.stringify({
+          type: 'event_new_upload',
+          eventCode: code,
+          uploadId,
+          guestName: guestName || 'Gjest',
+          message: message || '',
+          fileType,
+        }));
+      }
+    });
+  }
+
+  res.json({ success: true, uploadId, status });
+});
+
+// Hent godkjente opplastinger (for storskjerm)
+app.get('/api/events/:code/uploads', async (req, res) => {
+  const { code } = req.params;
+  if (!db) return res.status(503).json({ error: 'Firebase ikke tilgjengelig' });
+
+  const snap = await db.ref(`events/${code}/uploads`).get();
+  const uploads = snap.val() || {};
+  const approved = Object.values(uploads)
+    .filter((u) => u.status === 'approved')
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  res.json(approved);
+});
+
+// Moderer opplasting (godkjenn/avvis)
+app.post('/api/events/:code/uploads/:uploadId/moderate', async (req, res) => {
+  const { code, uploadId } = req.params;
+  const { token, action } = req.body; // action: 'approve' | 'reject'
+
+  if (!token) return res.status(401).json({ error: 'Ikke autorisert' });
+  if (!db) return res.status(503).json({ error: 'Firebase ikke tilgjengelig' });
+
+  let userData;
+  try {
+    userData = JSON.parse(Buffer.from(token, 'base64').toString());
+  } catch {
+    return res.status(401).json({ error: 'Ugyldig token' });
+  }
+
+  // Sjekk at bruker eier arrangementet
+  const eventSnap = await db.ref(`events/${code}`).get();
+  const event = eventSnap.val();
+  if (!event || event.ownerId !== userData.userId) {
+    return res.status(403).json({ error: 'Ikke autorisert' });
+  }
+
+  const status = action === 'approve' ? 'approved' : 'rejected';
+  await db.ref(`events/${code}/uploads/${uploadId}/status`).set(status);
+
+  // Varsle storskjerm om nytt godkjent innhold
+  if (status === 'approved') {
+    const uploadSnap = await db.ref(`events/${code}/uploads/${uploadId}`).get();
+    const upload = uploadSnap.val();
+    wss.clients.forEach(client => {
+      if (client.readyState === 1) {
+        client.send(JSON.stringify({
+          type: 'event_new_upload',
+          eventCode: code,
+          uploadId,
+          guestName: upload?.guestName || 'Gjest',
+          message: upload?.message || '',
+          fileType: upload?.fileType,
+        }));
+      }
+    });
+  }
+
+  res.json({ success: true, status });
+});
+
+// Hent alle arrangementer for en bruker
+app.get('/api/events/user/list', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token || !db) return res.status(401).json({ error: 'Ikke autorisert' });
+
+  let userData;
+  try {
+    userData = JSON.parse(Buffer.from(token, 'base64').toString());
+  } catch {
+    return res.status(401).json({ error: 'Ugyldig token' });
+  }
+
+  const snap = await db.ref('events').orderByChild('ownerId').equalTo(userData.userId).get();
+  const events = snap.val() || {};
+  res.json(Object.values(events).sort((a, b) => b.created - a.created));
+});
+
+// ─── Nedlasting av event ZIP ──────────────────────────────────────────────────
+app.get('/api/events/:code/download-info', async (req, res) => {
+  const { code } = req.params;
+  if (!db) return res.status(503).json({ error: 'Firebase ikke tilgjengelig' });
+
+  const snap = await db.ref(`events/${code}`).get();
+  const event = snap.val();
+  if (!event) return res.status(404).json({ error: 'Arrangement ikke funnet' });
+
+  if (event.zipStatus === 'ready') {
+    const daysLeft = event.zipDeleteAt
+      ? Math.ceil((event.zipDeleteAt - Date.now()) / (1000 * 60 * 60 * 24))
+      : 10;
+
+    res.json({
+      ready: true,
+      eventName: event.name,
+      uploadCount: event.zipUploadCount || 0,
+      daysLeft: Math.max(0, daysLeft),
+      downloadUrl: `https://ay.no/events/${code}/download`,
+    });
+  } else if (event.zipStatus === 'processing') {
+    res.json({ ready: false, status: 'processing', message: 'Pakker filer...' });
+  } else if (event.zipStatus === 'deleted') {
+    res.json({ ready: false, status: 'deleted', message: 'Filer er slettet' });
+  } else if (!event.active) {
+    res.json({ ready: false, status: 'pending', message: 'Pakker filer snart...' });
+  } else {
+    const expiresAt = event.expiresAt || (event.created + 5 * 24 * 60 * 60 * 1000);
+    const daysLeft = Math.ceil((expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
+    res.json({
+      ready: false,
+      status: 'active',
+      message: `Arrangementet er aktivt i ${Math.max(0, daysLeft)} dager til`,
+      daysLeft: Math.max(0, daysLeft),
+    });
+  }
+});
+
+// Manuell lukking av arrangement (brudeparet kan lukke tidlig)
+app.post('/api/events/:code/close', async (req, res) => {
+  const { code } = req.params;
+  const { token } = req.body;
+  if (!token || !db) return res.status(401).json({ error: 'Ikke autorisert' });
+
+  let userData;
+  try {
+    userData = JSON.parse(Buffer.from(token, 'base64').toString());
+  } catch {
+    return res.status(401).json({ error: 'Ugyldig token' });
+  }
+
+  const snap = await db.ref(`events/${code}`).get();
+  const event = snap.val();
+  if (!event || event.ownerId !== userData.userId) {
+    return res.status(403).json({ error: 'Ikke autorisert' });
+  }
+
+  await db.ref(`events/${code}`).update({
+    active: false,
+    closedAt: Date.now(),
+    zipStatus: 'pending',
+  });
+
+  // Start pakking
+  const { packEventToZip } = require('./events_storage');
+  packEventToZip(code, db, async (phone, msg) => {
+    // SMS-sending
+    const smsUrl = process.env.SMS_GATEWAY_URL || 'https://sms.ay.no';
+    const smsApiKey = process.env.SMS_GATEWAY_API_KEY;
+    const headers = { 'Content-Type': 'application/json' };
+    if (smsApiKey) headers['Authorization'] = 'Bearer ' + smsApiKey;
+    try {
+      await fetch(`${smsUrl}/api/3rdparty/v1/message`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ message: msg, phoneNumbers: [phone] }),
+      });
+    } catch (_) {}
+  });
+
+  res.json({ success: true, message: 'Arrangement lukket — pakker filer og sender SMS' });
 });
